@@ -1,6 +1,7 @@
 require(igraph)
 require(jsonlite)
 require(Rtsne)
+require(ape)
 
 # open TN93 distance matrix
 cat("loading TN93 distance matrix\n")
@@ -19,7 +20,7 @@ cat("hierarchical clustering\n")
 
 # cluster t-stochastic neighbor embedding
 set.seed(1)
-res <- Rtsne(tn93, is_distance=TRUE, verbose=TRUE)
+res <- Rtsne(tn93, is_distance=TRUE, verbose=TRUE, num_threads=2)
 hc <- hclust(dist(res$Y))
 clusters <- cutree(hc, h=10)
 
@@ -27,14 +28,19 @@ clusters <- cutree(hc, h=10)
 headers <- rep(NA, times=nrow(tn93))
 con <- file('data/variants.fa', open='r')
 i <- 1
+L <- 0
 while (length(line <- readLines(con, n=1, warn=FALSE)) > 0) {
   if (grepl("^>", line)) {
     headers[i] <- gsub("^>(.+)", "\\1", line)
     i <- i + 1
   }
+  else if (L == 0) {
+    L <- nchar(line)
+  }
 }
 close(con)
 stopifnot(length(headers) == nrow(tn93))
+names(tn93) <- headers
 accns <- gsub("^.+(EPI_[A-Z]+_[0-9]+).+$", "\\1", headers)
 
 # extract sample collection dates from headers
@@ -80,36 +86,83 @@ traverse <- function(node, parent, el, edges=c()) {
   temp <- el[apply(el, 1, function(e) is.element(node, e)), ]
   temp <- unique(as.vector(temp))
   children <- temp[!is.element(temp, c(node, parent))]
-
-  # TODO: sort children vector by genetic distance
-  row <- tn93[which(headers==node), ]
-  adj.dists <- row[match(children, headers)]
-  adj.dates <- as.Date(gsub(".+\\|([0-9]+-[0-9]+-[0-9]+)$", "\\1", children))
-  
-  children <- children[order(adj.dists, adj.dates)]  # increasing
   for (child in children) {
     edges <- traverse(child, node, el, edges)
   }
   return(edges)
 }
 
+
+count.tips <- function(edge.mx) {
+  # convert matrix to data frame
+  edge.df <- as.data.frame(edge.mx, stringsAsFactors = FALSE)
+  names(edge.df) <- c('parent', 'child')
+  edge.df$n.tips <- 0
+  edge.df$coldate <- sapply(edge.df$child, function(x) {
+    as.Date(strsplit(x, "\\|")[[1]][3])
+  })
+  
+  # retrieve row indices of tips
+  idx <- !is.element(edge.df$child, edge.df$parent)
+  edge.df$n.tips[idx] <- 1
+  children <- edge.df$child[idx]  # tip labels
+  
+  while (length(children) > 0) {
+    # retrieve parents
+    idx <- match(children, edge.df$child)
+    parents <- edge.df$parent[idx]
+    
+    # find next parents
+    idx2 <- unique(match(parents, edge.df$child))
+    
+    temp <- sapply(
+      split(idx, parents), function(x) sum(edge.df$n.tips[x])
+    )
+    
+    if (any(is.na(idx2))) {
+      drop <- which(is.na(idx2))
+      idx2 <- idx2[-drop]
+      temp <- temp[-drop]
+    } 
+    
+    # propagate tip counts
+    edge.df$n.tips[idx2] <- temp
+    children <- edge.df$child[idx2]
+  }
+  
+  edge.df
+}
+
+
+reorder.edges <- function(edge.df, tn93) {
+  # augment data frame with TN93 distances
+  edge.df$dist <- sapply(1:nrow(edge.df), function(i) {
+    row <- match(edge.df$parent[i], colnames(tn93))
+    col <- match(edge.df$child[i], colnames(tn93))
+    tn93[row, col]
+  })
+  
+  idx <- match(edge.df$parent, unique(edge.df$parent))
+  idx2 <- as.vector(unlist(lapply(split(1:nrow(edge.df), idx), function(i) {
+    rows <- edge.df[i, ]
+    i[order(rows$n.tips, rows$dist, rows$coldate)]
+  })))
+  edge.df[idx2, ]
+}
+
+
 result <- list()
 for (i in 1:max(clusters)) {
-#result <- lapply(1:max(clusters), function(i) {
-  #cat (paste0(i, '\n'))
-  cat('.')
+  cat('.')  # crude progress monitoring
   
   # extract cluster indices to map to headers vector
   idx <- as.integer(which(clusters==i))
 
-  # cluster mean pairwise distance
-  pdist <- mean.pdist[[i]]
-  
-  # cluster mean root distance
-  rdist <- mean.rdist[[i]]
+  pdist <- mean.pdist[[i]]  # cluster mean pairwise distance
+  rdist <- mean.rdist[[i]]  # cluster mean root distance
   
   if (length(idx)==1) {
-    list(nodes=headers[idx], edges=NA)
+    list(nodes=headers[idx], edges=NA, pdist=pdist, rdist=rdist)
   } 
   else {
     # find earliest variant in cluster that is closest to root
@@ -129,6 +182,10 @@ for (i in 1:max(clusters)) {
     el <- get.edgelist(g.mst)
     edges <- traverse(subroot, NA, el)
 
+    edge.mx <- matrix(edges, ncol=2, byrow=TRUE)
+    edge.df <- count.tips(edge.mx)
+    edge.df <- reorder.edges(edge.df, tn93)
+    
     # store variant data
     nodes <- list()
     for (node in unique(edges)) {
@@ -144,19 +201,17 @@ for (i in 1:max(clusters)) {
     }
 
     # shorten edge list to accession numbers only
-    edges <- gsub("^.+(EPI_[A-Z]+_[0-9]+).+$", "\\1", edges)
-    edges <- matrix(edges, ncol=2, byrow=TRUE)
+    edges <- cbind(
+      gsub("^.+(EPI_[A-Z]+_[0-9]+).+$", "\\1", edge.df$parent),
+      gsub("^.+(EPI_[A-Z]+_[0-9]+).+$", "\\1", edge.df$child),
+      round(edge.df$dist * L, 2)
+    )
     
-    dists <- apply(edges, 1, function(e) {
-      tn93[which(accns==e[1]), which(accns==e[2])]
-    })
-    edges <- cbind(edges, round(dists*29903, 2))
-
     result[[length(result)+1]] <- list(
       pdist=pdist, rdist=rdist, nodes=nodes, edges=edges
       )
   }
-}#)
+}
 cat ('\nwriting JSON file\n')
 write(toJSON(result, pretty=TRUE), file="data/clusters.json")
 
